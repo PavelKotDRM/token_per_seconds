@@ -1,11 +1,14 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+mod export;
 mod simulation;
+mod stats;
 
 use std::time::Instant;
 
 use eframe::egui;
 use simulation::{Simulation, TokenizerKind};
+use stats::Stats;
 
 const EXAMPLES: &[(&str, &str)] = &[
     (
@@ -83,19 +86,143 @@ const EXTRA_PARAGRAPHS: &[&str] = &[
     "בבוקר החוקרים נפגשים כדי לדון בשאלות וברעיונות. חלקם מתבוננים באוקיינוס, אחרים חוקרים כוכבים או כותבים תוכנות לניתוח נתונים. יחד הם משווים תוצאות, בודקים השערות ומשתפים תגליות חדשות.\n\nטכנולוגיה יכולה לחבר בין אנשים, לסייע בלמידה ולפתוח נקודות מבט חדשות. עם זאת חשוב לבדוק את התוצאות בזהירות ולהבין את ההקשר והמגבלות שלהן.",
 ];
 
-fn example_text(index: usize) -> String {
-    let passage = format!("{}\n\n{}", EXAMPLES[index].1, EXTRA_PARAGRAPHS[index]);
-    let repetitions = 16_000_usize.div_ceil(passage.chars().count());
-    std::iter::repeat_n(passage.as_str(), repetitions)
+fn repeat_text(passage: &str) -> String {
+    let repetitions = 16_000_usize.div_ceil(passage.chars().count().max(1));
+    std::iter::repeat_n(passage, repetitions)
         .collect::<Vec<_>>()
         .join("\n\n")
 }
 
+fn base_text(index: usize) -> String {
+    format!("{}\n\n{}", EXAMPLES[index].1, EXTRA_PARAGRAPHS[index])
+}
+
+fn short_label(name: &str) -> String {
+    let parts: Vec<_> = std::path::Path::new(name)
+        .components()
+        .rev()
+        .take(2)
+        .map(|part| part.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    parts.into_iter().rev().collect::<Vec<_>>().join("/")
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Tab {
+    Texts,
+    Efficiency,
+    Compare,
+    Matrix,
+    Simulator,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Metric {
+    CharsPerToken,
+    BytesPerToken,
+    TokensPerWord,
+}
+
+impl Metric {
+    fn label(self) -> &'static str {
+        match self {
+            Self::CharsPerToken => "characters per token (higher = better compression)",
+            Self::BytesPerToken => "UTF-8 bytes per token (higher = better compression)",
+            Self::TokensPerWord => "tokens per word (lower = better compression)",
+        }
+    }
+
+    fn value(self, stats: &Stats) -> f64 {
+        match self {
+            Self::CharsPerToken => stats.chars_per_token(),
+            Self::BytesPerToken => stats.bytes_per_token(),
+            Self::TokensPerWord => stats.tokens_per_word(),
+        }
+    }
+}
+
+const BAR_COLORS: [egui::Color32; 6] = [
+    egui::Color32::from_rgb(70, 130, 200),
+    egui::Color32::from_rgb(220, 140, 50),
+    egui::Color32::from_rgb(80, 170, 100),
+    egui::Color32::from_rgb(180, 90, 170),
+    egui::Color32::from_rgb(200, 80, 80),
+    egui::Color32::from_rgb(120, 120, 120),
+];
+
+const BEST_COLOR: egui::Color32 = egui::Color32::from_rgb(70, 170, 100);
+
+// Thousands separated by thin spaces for readability.
+fn group(value: usize) -> String {
+    let digits = value.to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push('\u{202f}');
+        }
+        out.push(c);
+    }
+    out
+}
+
+fn number_cell(ui: &mut egui::Ui, text: egui::RichText) {
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        ui.label(text);
+    });
+}
+
+fn tab_description(tab: Tab) -> &'static str {
+    match tab {
+        Tab::Texts => "Read and edit the text of each language. Statistics update immediately.",
+        Tab::Efficiency => "How compactly one tokenizer encodes every language.",
+        Tab::Compare => {
+            "How tokenizers compare with each other, per language or across all of them."
+        }
+        Tab::Matrix => {
+            "All languages and tokenizers at a glance; colour shows relative compression."
+        }
+        Tab::Simulator => {
+            "Live output of every language and tokenizer at the same tokens per second."
+        }
+    }
+}
+
+fn apply_style(ctx: &egui::Context) {
+    ctx.all_styles_mut(|style| {
+        use egui::{FontId, TextStyle};
+        style
+            .text_styles
+            .insert(TextStyle::Body, FontId::proportional(15.0));
+        style
+            .text_styles
+            .insert(TextStyle::Button, FontId::proportional(15.0));
+        style
+            .text_styles
+            .insert(TextStyle::Heading, FontId::proportional(22.0));
+        style
+            .text_styles
+            .insert(TextStyle::Small, FontId::proportional(12.5));
+        style.spacing.item_spacing = egui::vec2(10.0, 8.0);
+        style.spacing.button_padding = egui::vec2(10.0, 5.0);
+        style.spacing.interact_size.y = 26.0;
+    });
+}
+
 struct App {
-    tokenizer: TokenizerKind,
-    simulation: Simulation,
-    text: String,
-    example: usize,
+    tokenizers: Vec<TokenizerKind>,
+    // stats[tokenizer][language] for the base passage of each example.
+    stats: Vec<Vec<Stats>>,
+    current: usize,
+    tab: Tab,
+    metric: Metric,
+    view_language: usize,
+    efficiency_tokenizer: usize,
+    sort_efficiency: bool,
+    include_builtin: bool,
+    compare_language: usize,
+    show_samples: bool,
+    sims: Vec<Vec<Simulation>>,
+    texts: Vec<String>,
     speed: f64,
     prepared: bool,
     error: Option<String>,
@@ -103,156 +230,668 @@ struct App {
 
 impl App {
     fn new() -> Result<Self, String> {
-        Ok(Self {
-            tokenizer: TokenizerKind::openai("o200k_base")?,
-            simulation: Simulation::default(),
-            text: example_text(1),
-            example: 1,
+        let mut app = Self {
+            tokenizers: Vec::new(),
+            stats: Vec::new(),
+            current: 0,
+            tab: Tab::Texts,
+            metric: Metric::CharsPerToken,
+            view_language: 0,
+            efficiency_tokenizer: 0,
+            sort_efficiency: true,
+            include_builtin: false,
+            compare_language: EXAMPLES.len(),
+            show_samples: false,
+            sims: Vec::new(),
+            texts: (0..EXAMPLES.len()).map(base_text).collect(),
             speed: 20.0,
             prepared: false,
             error: None,
-        })
+        };
+        app.add_tokenizer(TokenizerKind::openai("o200k_base")?)?;
+        app.add_tokenizer(TokenizerKind::openai("cl100k_base")?)?;
+        app.current = 0;
+        app.invalidate();
+        Ok(app)
+    }
+
+    fn load_tokenizers(&mut self) {
+        let Some(paths) = rfd::FileDialog::new()
+            .add_filter("Hugging Face tokenizer", &["json"])
+            .pick_files()
+        else {
+            return;
+        };
+        let mut errors = Vec::new();
+        for path in paths {
+            let result = TokenizerKind::hugging_face(&path)
+                .and_then(|tokenizer| self.add_tokenizer(tokenizer));
+            if let Err(error) = result {
+                errors.push(format!("{}: {error}", path.display()));
+            }
+        }
+        self.invalidate();
+        if !errors.is_empty() {
+            self.error = Some(format!("Could not load tokenizer: {}", errors.join("; ")));
+        }
+    }
+
+    fn export_report(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("HTML", &["html"])
+            .set_file_name("tokenizer-statistics.html")
+            .save_file()
+        else {
+            return;
+        };
+        let languages: Vec<&str> = EXAMPLES.iter().map(|(name, _)| *name).collect();
+        let html = export::build_report(&self.labels(), &languages, &self.visible_stats());
+        self.error = std::fs::write(&path, html)
+            .err()
+            .map(|error| format!("Could not save {}: {error}", path.display()));
+    }
+
+    fn tokenizer_bar(&mut self, ui: &mut egui::Ui) {
+        let labels = self.all_labels();
+        let picked = std::cell::Cell::new(None);
+        let pick = |ui: &mut egui::Ui, index: usize, app: &Self| {
+            if ui
+                .selectable_label(app.current == index, &labels[index])
+                .on_hover_text(app.tokenizers[index].name())
+                .clicked()
+            {
+                picked.set(Some(index));
+            }
+        };
+        let has_custom = self.tokenizers.iter().any(|t| !t.is_builtin());
+        if has_custom {
+            egui::CollapsingHeader::new("Built-in tokenizers")
+                .id_salt("builtin_tokenizers")
+                .show(ui, |ui| {
+                    ui.checkbox(
+                        &mut self.include_builtin,
+                        "Include built-in tokenizers in comparisons and simulation",
+                    );
+                    ui.horizontal_wrapped(|ui| {
+                        for index in
+                            (0..self.tokenizers.len()).filter(|&i| self.tokenizers[i].is_builtin())
+                        {
+                            pick(ui, index, self);
+                        }
+                    });
+                });
+        }
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Tokenizer:");
+            for index in 0..self.tokenizers.len() {
+                if !has_custom || !self.tokenizers[index].is_builtin() {
+                    pick(ui, index, self);
+                }
+            }
+            if let Some(index) = picked.take()
+                && self.current != index
+            {
+                self.current = index;
+                self.invalidate();
+            }
+            if ui.button("Export HTML report…").clicked() {
+                self.export_report();
+            }
+            if ui.button("Load tokenizer.json files…").clicked() {
+                self.load_tokenizers();
+            }
+            if self.tokenizers.len() > 1 && ui.button("Remove selected").clicked() {
+                self.tokenizers.remove(self.current);
+                self.stats.remove(self.current);
+                self.current = 0;
+                self.efficiency_tokenizer = 0;
+                self.invalidate();
+            }
+        });
+        if let Some(error) = &self.error {
+            ui.colored_label(egui::Color32::LIGHT_RED, error);
+        }
+    }
+
+    fn refresh_stats(&mut self, language: usize) {
+        for (tokenizer, stats) in self.tokenizers.iter().zip(&mut self.stats) {
+            match Stats::measure(tokenizer, &self.texts[language]) {
+                Ok(measured) => stats[language] = measured,
+                Err(error) => self.error = Some(format!("Tokenization failed: {error}")),
+            }
+        }
+    }
+
+    fn add_tokenizer(&mut self, tokenizer: TokenizerKind) -> Result<(), String> {
+        let stats = self
+            .texts
+            .iter()
+            .map(|text| Stats::measure(&tokenizer, text))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.tokenizers.push(tokenizer);
+        self.stats.push(stats);
+        self.current = self.tokenizers.len() - 1;
+        Ok(())
+    }
+
+    fn all_labels(&self) -> Vec<String> {
+        self.tokenizers
+            .iter()
+            .map(|tokenizer| short_label(tokenizer.name()))
+            .collect()
+    }
+
+    // Built-in tokenizers are left out of comparisons once custom ones are loaded,
+    // unless explicitly included.
+    fn visible(&self) -> Vec<usize> {
+        let has_custom = self.tokenizers.iter().any(|t| !t.is_builtin());
+        (0..self.tokenizers.len())
+            .filter(|&i| self.include_builtin || !has_custom || !self.tokenizers[i].is_builtin())
+            .collect()
+    }
+
+    fn labels(&self) -> Vec<String> {
+        let labels = self.all_labels();
+        self.visible()
+            .into_iter()
+            .map(|i| labels[i].clone())
+            .collect()
+    }
+
+    fn visible_stats(&self) -> Vec<&Vec<Stats>> {
+        self.visible().into_iter().map(|i| &self.stats[i]).collect()
+    }
+
+    fn texts_tab(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            for (index, (name, _)) in EXAMPLES.iter().enumerate() {
+                ui.selectable_value(&mut self.view_language, index, *name);
+            }
+        });
+        ui.horizontal(|ui| {
+            if ui.button("◀ Previous").clicked() {
+                self.view_language = (self.view_language + EXAMPLES.len() - 1) % EXAMPLES.len();
+            }
+            if ui.button("Next ▶").clicked() {
+                self.view_language = (self.view_language + 1) % EXAMPLES.len();
+            }
+        });
+        let language = self.view_language;
+        ui.heading(EXAMPLES[language].0);
+        let changed = ui
+            .add(
+                egui::TextEdit::multiline(&mut self.texts[language])
+                    .desired_rows(8)
+                    .desired_width(f32::INFINITY),
+            )
+            .changed();
+        if ui.button("Restore example").clicked() {
+            self.texts[language] = base_text(language);
+            self.refresh_stats(language);
+            self.invalidate();
+        } else if changed {
+            self.refresh_stats(language);
+            self.invalidate();
+        }
+        ui.add_space(8.0);
+        let labels = self.labels();
+        let visible_stats = self.visible_stats();
+        let first = &visible_stats[0][language];
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.strong("Length:");
+                ui.label(format!("{} characters (no whitespace)", group(first.chars)));
+                ui.label("·");
+                ui.label(format!("{} UTF-8 bytes", group(first.bytes)));
+                ui.label("·");
+                ui.strong("Linguistic length:");
+                ui.label(format!("{} words", group(first.words)));
+            });
+        });
+        ui.add_space(4.0);
+        let best = visible_stats
+            .iter()
+            .map(|s| s[language].chars_per_token())
+            .fold(f64::MIN, f64::max);
+        egui::Grid::new("text_stats")
+            .striped(true)
+            .num_columns(5)
+            .spacing([24.0, 6.0])
+            .show(ui, |ui| {
+                ui.strong("Tokenizer");
+                for header in ["Tokens", "Chars/token", "Bytes/token", "Tokens/word"] {
+                    number_cell(ui, egui::RichText::new(header).strong());
+                }
+                ui.end_row();
+                for (label, stats) in labels.iter().zip(&visible_stats) {
+                    let stats = &stats[language];
+                    let is_best = (stats.chars_per_token() - best).abs() < 1e-9;
+                    let mark = |text: String| {
+                        let text = egui::RichText::new(text);
+                        if is_best {
+                            text.strong().color(BEST_COLOR)
+                        } else {
+                            text
+                        }
+                    };
+                    ui.label(mark(label.clone()));
+                    number_cell(ui, mark(group(stats.tokens)));
+                    number_cell(ui, mark(format!("{:.2}", stats.chars_per_token())));
+                    number_cell(ui, mark(format!("{:.2}", stats.bytes_per_token())));
+                    number_cell(ui, mark(format!("{:.2}", stats.tokens_per_word())));
+                    ui.end_row();
+                }
+            });
+        ui.add_space(4.0);
+        ui.small("Green marks the tokenizer with the best compression (most characters per token). Statistics are computed for the text above, not the repeated simulator text.");
+    }
+
+    fn metric_selector(&mut self, ui: &mut egui::Ui) {
+        egui::ComboBox::from_label("Metric")
+            .selected_text(self.metric.label())
+            .show_ui(ui, |ui| {
+                for metric in [
+                    Metric::CharsPerToken,
+                    Metric::BytesPerToken,
+                    Metric::TokensPerWord,
+                ] {
+                    ui.selectable_value(&mut self.metric, metric, metric.label());
+                }
+            });
+    }
+
+    fn efficiency_tab(&mut self, ui: &mut egui::Ui) {
+        let labels = self.labels();
+        self.efficiency_tokenizer = self.efficiency_tokenizer.min(labels.len() - 1);
+        ui.horizontal_wrapped(|ui| {
+            egui::ComboBox::from_label("Tokenizer")
+                .selected_text(&labels[self.efficiency_tokenizer])
+                .show_ui(ui, |ui| {
+                    for (index, label) in labels.iter().enumerate() {
+                        ui.selectable_value(&mut self.efficiency_tokenizer, index, label);
+                    }
+                });
+            self.metric_selector(ui);
+            ui.checkbox(&mut self.sort_efficiency, "Sort by efficiency");
+        });
+        ui.add_space(8.0);
+        let stats = self.visible_stats()[self.efficiency_tokenizer];
+        let values: Vec<f64> = stats.iter().map(|s| self.metric.value(s)).collect();
+        let max = values.iter().cloned().fold(f64::MIN_POSITIVE, f64::max);
+        let higher_is_better = self.metric != Metric::TokensPerWord;
+        let mut order: Vec<usize> = (0..EXAMPLES.len()).collect();
+        if self.sort_efficiency {
+            order.sort_by(|&a, &b| {
+                let ordering = values[a].total_cmp(&values[b]);
+                if higher_is_better {
+                    ordering.reverse()
+                } else {
+                    ordering
+                }
+            });
+        }
+        let best = order.first().copied();
+        for index in order {
+            let is_best = self.sort_efficiency && Some(index) == best;
+            ui.horizontal(|ui| {
+                ui.add_sized([100.0, 22.0], egui::Label::new(EXAMPLES[index].0));
+                ui.add(
+                    egui::ProgressBar::new((values[index] / max) as f32)
+                        .desired_width(ui.available_width())
+                        .desired_height(22.0)
+                        .fill(if is_best { BEST_COLOR } else { BAR_COLORS[0] })
+                        .text(format!("{:.2}", values[index])),
+                );
+            });
+        }
+        ui.add_space(6.0);
+        ui.small("Bars are scaled to the best language for this tokenizer.");
+    }
+
+    fn compare_tab(&mut self, ui: &mut egui::Ui) {
+        let labels = self.labels();
+        ui.horizontal_wrapped(|ui| {
+            let selected = EXAMPLES
+                .get(self.compare_language)
+                .map_or("All languages", |e| e.0);
+            egui::ComboBox::from_label("Language")
+                .selected_text(selected)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut self.compare_language,
+                        EXAMPLES.len(),
+                        "All languages",
+                    );
+                    for (index, (name, _)) in EXAMPLES.iter().enumerate() {
+                        ui.selectable_value(&mut self.compare_language, index, *name);
+                    }
+                });
+            self.metric_selector(ui);
+        });
+        ui.horizontal_wrapped(|ui| {
+            for (index, label) in labels.iter().enumerate() {
+                ui.colored_label(BAR_COLORS[index % BAR_COLORS.len()], format!("■ {label}"));
+            }
+        });
+        ui.add_space(8.0);
+        let languages: Vec<usize> = match self.compare_language {
+            index if index < EXAMPLES.len() => vec![index],
+            _ => (0..EXAMPLES.len()).collect(),
+        };
+        let visible_stats = self.visible_stats();
+        let max = languages
+            .iter()
+            .flat_map(|&language| visible_stats.iter().map(move |s| (language, s)))
+            .map(|(language, s)| self.metric.value(&s[language]))
+            .fold(f64::MIN_POSITIVE, f64::max);
+        for language in languages {
+            ui.label(egui::RichText::new(EXAMPLES[language].0).strong());
+            for (index, stats) in visible_stats.iter().enumerate() {
+                let value = self.metric.value(&stats[language]);
+                let base = self.metric.value(&visible_stats[0][language]);
+                let versus = if base > 0.0 {
+                    value / base * 100.0
+                } else {
+                    0.0
+                };
+                ui.add(
+                    egui::ProgressBar::new((value / max) as f32)
+                        .fill(BAR_COLORS[index % BAR_COLORS.len()])
+                        .text(format!("{value:.2} ({versus:.0}% of {})", labels[0])),
+                );
+            }
+            ui.add_space(6.0);
+        }
+    }
+
+    fn matrix_tab(&mut self, ui: &mut egui::Ui) {
+        let labels = self.labels();
+        ui.horizontal_wrapped(|ui| {
+            self.metric_selector(ui);
+            ui.checkbox(&mut self.show_samples, "Show first tokens of each text");
+        });
+        ui.small("Cell colour: green = better compression, red = worse (relative to all cells).");
+        let visible_stats = self.visible_stats();
+        let values: Vec<f64> = visible_stats
+            .iter()
+            .flat_map(|s| s.iter())
+            .map(|s| self.metric.value(s))
+            .collect();
+        let min = values.iter().cloned().fold(f64::MAX, f64::min);
+        let max = values.iter().cloned().fold(f64::MIN, f64::max);
+        let better_is_high = self.metric != Metric::TokensPerWord;
+        egui::ScrollArea::both().show(ui, |ui| {
+            egui::Grid::new("matrix")
+                .striped(false)
+                .spacing([6.0, 6.0])
+                .show(ui, |ui| {
+                    ui.strong("Language");
+                    for label in &labels {
+                        ui.strong(label);
+                    }
+                    ui.end_row();
+                    for (language, (name, _)) in EXAMPLES.iter().enumerate() {
+                        ui.strong(*name);
+                        for stats in &visible_stats {
+                            let stats = &stats[language];
+                            let value = self.metric.value(stats);
+                            let mut t = if max > min {
+                                ((value - min) / (max - min)) as f32
+                            } else {
+                                0.5
+                            };
+                            if !better_is_high {
+                                t = 1.0 - t;
+                            }
+                            let color = egui::Color32::from_rgb(
+                                (230.0 - 100.0 * t) as u8,
+                                (120.0 + 90.0 * t) as u8,
+                                110,
+                            );
+                            egui::Frame::new()
+                                .fill(color)
+                                .inner_margin(4.0)
+                                .show(ui, |ui| {
+                                    ui.set_min_width(110.0);
+                                    ui.colored_label(
+                                        egui::Color32::BLACK,
+                                        format!("{:.2}  ({} tok.)", value, stats.tokens),
+                                    );
+                                    if self.show_samples {
+                                        ui.colored_label(egui::Color32::BLACK, &stats.sample);
+                                    }
+                                });
+                        }
+                        ui.end_row();
+                    }
+                });
+        });
     }
 
     fn invalidate(&mut self) {
-        self.simulation = Simulation::default();
+        self.sims = self
+            .tokenizers
+            .iter()
+            .map(|_| (0..EXAMPLES.len()).map(|_| Simulation::default()).collect())
+            .collect();
         self.prepared = false;
         self.error = None;
     }
 
-    fn select_tokenizer(&mut self, result: Result<TokenizerKind, String>) {
-        match result {
-            Ok(tokenizer) => {
-                self.tokenizer = tokenizer;
-                self.invalidate();
-            }
-            Err(error) => self.error = Some(format!("Could not load tokenizer: {error}")),
-        }
+    fn all_sims(&mut self) -> impl Iterator<Item = &mut Simulation> {
+        self.sims.iter_mut().flatten()
+    }
+
+    fn running(&self) -> bool {
+        self.sims.iter().flatten().any(|sim| sim.running)
     }
 
     fn prepare(&mut self) {
-        match self.simulation.prepare(&self.tokenizer, &self.text) {
-            Ok(()) => {
-                self.prepared = true;
-                self.error = None;
-            }
-            Err(error) => {
-                self.invalidate();
-                self.error = Some(format!("Tokenization failed: {error}"));
+        let texts: Vec<String> = self.texts.iter().map(|text| repeat_text(text)).collect();
+        for (tokenizer, sims) in self.tokenizers.iter().zip(&mut self.sims) {
+            for (sim, text) in sims.iter_mut().zip(&texts) {
+                if let Err(error) = sim.prepare(tokenizer, text) {
+                    self.invalidate();
+                    self.error = Some(format!("Tokenization failed: {error}"));
+                    return;
+                }
             }
         }
+        self.prepared = true;
+        self.error = None;
     }
+
+    fn simulator_tab(&mut self, ui: &mut egui::Ui) {
+        ui.add(
+            egui::Slider::new(&mut self.speed, 1.0..=1500.0)
+                .integer()
+                .text("tokens/s"),
+        );
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("Count tokens").clicked() {
+                self.prepare();
+            }
+            if self.running() {
+                if ui.button("Pause").clicked() {
+                    self.all_sims().for_each(Simulation::pause);
+                }
+            } else {
+                let partial = self
+                    .sims
+                    .iter()
+                    .flatten()
+                    .any(|sim| sim.shown > 0 && sim.shown < sim.ids.len());
+                if ui
+                    .button(if partial { "Resume" } else { "Start" })
+                    .clicked()
+                {
+                    if !self.prepared {
+                        self.prepare();
+                    }
+                    if self.prepared {
+                        let now = Instant::now();
+                        self.all_sims().for_each(|sim| sim.start(now));
+                    }
+                }
+            }
+            if ui.button("Restart").clicked() && self.prepared {
+                let now = Instant::now();
+                self.all_sims().for_each(|sim| {
+                    sim.shown = sim.ids.len();
+                    sim.start(now);
+                });
+            }
+        });
+        if !self.prepared {
+            ui.label("Count tokens or start the simulation. The texts come from the Texts tab and are repeated to keep playback visible at high speeds.");
+        }
+        ui.small("This is a simulation, not model generation. Every cell runs at the same speed; decoded text may differ from the input and only the latest characters are shown.");
+        let labels = self.labels();
+        let visible_sims: Vec<&Vec<Simulation>> =
+            self.visible().into_iter().map(|i| &self.sims[i]).collect();
+        egui::ScrollArea::both().show(ui, |ui| {
+            egui::Grid::new("sim_matrix")
+                .spacing([8.0, 8.0])
+                .show(ui, |ui| {
+                    ui.strong("Language");
+                    for label in &labels {
+                        ui.strong(label);
+                    }
+                    ui.end_row();
+                    for (language, (name, _)) in EXAMPLES.iter().enumerate() {
+                        ui.strong(*name);
+                        for sims in &visible_sims {
+                            let sim = &sims[language];
+                            ui.vertical(|ui| {
+                                let (rect, _) = ui.allocate_exact_size(
+                                    egui::vec2(CELL_WIDTH, CELL_HEIGHT),
+                                    egui::Sense::hover(),
+                                );
+                                ui.painter().rect(
+                                    rect,
+                                    4.0,
+                                    ui.visuals().extreme_bg_color,
+                                    ui.visuals().widgets.noninteractive.bg_stroke,
+                                    egui::StrokeKind::Inside,
+                                );
+                                let mut cell =
+                                    ui.new_child(egui::UiBuilder::new().max_rect(rect.shrink(6.0)));
+                                cell.set_clip_rect(rect.shrink(2.0).intersect(ui.clip_rect()));
+                                cell.label(highlighted(
+                                    page(&sim.output, PAGE_CHARS),
+                                    cell.visuals().text_color(),
+                                    sim.running,
+                                ));
+                                if self.prepared && !sim.ids.is_empty() {
+                                    let total = sim.ids.len();
+                                    ui.add_sized(
+                                        [CELL_WIDTH, 14.0],
+                                        egui::ProgressBar::new(sim.shown as f32 / total as f32)
+                                            .text(format!("{} / {} tokens", sim.shown, total)),
+                                    );
+                                    ui.small(format!(
+                                        "Total ≈ {:.1} s, left ≈ {:.1} s",
+                                        total as f64 / self.speed,
+                                        (total - sim.shown) as f64 / self.speed
+                                    ));
+                                }
+                            });
+                        }
+                        ui.end_row();
+                    }
+                });
+        });
+    }
+}
+
+const CELL_WIDTH: f32 = 320.0;
+const CELL_HEIGHT: f32 = 130.0;
+const PAGE_CHARS: usize = 200;
+const FRESH_CHARS: usize = 12;
+
+// The newest characters are drawn in an accent colour so growth is easy to follow.
+fn highlighted(text: &str, color: egui::Color32, running: bool) -> egui::text::LayoutJob {
+    let split = text
+        .char_indices()
+        .rev()
+        .nth(FRESH_CHARS.saturating_sub(1))
+        .map_or(0, |(i, _)| i);
+    let font_id = egui::FontId::proportional(13.0);
+    let mut job = egui::text::LayoutJob::default();
+    job.append(
+        &text[..split],
+        0.0,
+        egui::TextFormat::simple(font_id.clone(), color),
+    );
+    let accent = egui::Color32::from_rgb(255, 170, 40);
+    job.append(
+        &text[split..],
+        0.0,
+        egui::TextFormat::simple(font_id.clone(), accent),
+    );
+    if running {
+        job.append("▌", 0.0, egui::TextFormat::simple(font_id, accent));
+    }
+    job
+}
+
+// Shows the text from the start of the current "page" so that earlier lines
+// stay in place while new text is appended; the cell clears when a page fills.
+fn page(text: &str, page_chars: usize) -> &str {
+    let skip = text.chars().count() / page_chars * page_chars;
+    text.char_indices()
+        .nth(skip)
+        .map_or("", |(i, _)| &text[i..])
 }
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let now = Instant::now();
-        if let Err(error) = self.simulation.advance(now, self.speed, &self.tokenizer) {
-            self.simulation.pause();
+        let speed = self.speed;
+        let mut failure = None;
+        for (tokenizer, sims) in self.tokenizers.iter().zip(&mut self.sims) {
+            for sim in sims {
+                if let Err(error) = sim.advance(now, speed, tokenizer) {
+                    failure = Some(error);
+                }
+            }
+        }
+        if let Some(error) = failure {
+            self.all_sims().for_each(Simulation::pause);
             self.error = Some(format!("Decoding failed: {error}"));
         }
         egui::CentralPanel::default().show(ui, |ui| {
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                ui.heading("Token generation simulator");
-                ui.label("Compare how tokenizers split text and how output appears at the selected speed.");
-                ui.add_space(12.0);
-                ui.heading("1. Tokenizer");
-                ui.horizontal_wrapped(|ui| {
-                    if ui.button("OpenAI o200k_base").clicked() {
-                        self.select_tokenizer(TokenizerKind::openai("o200k_base"));
-                    }
-                    if ui.button("OpenAI cl100k_base").clicked() {
-                        self.select_tokenizer(TokenizerKind::openai("cl100k_base"));
-                    }
-                    if ui.button("Open tokenizer.json…").clicked() {
-                        if let Some(path) = rfd::FileDialog::new()
-                            .add_filter("Hugging Face tokenizer", &["json"])
-                            .pick_file()
-                        {
-                            self.select_tokenizer(TokenizerKind::hugging_face(&path));
-                        }
-                    }
-                });
-                ui.label(format!("Selected: {}", self.tokenizer.name()));
-                ui.add_space(12.0);
-                ui.heading("2. Text");
-                ui.horizontal_wrapped(|ui| {
-                    ui.label("Example:");
-                    let old = self.example;
-                    egui::ComboBox::from_id_salt("language")
-                        .selected_text(EXAMPLES[self.example].0)
-                        .show_ui(ui, |ui| {
-                            for (index, (name, _)) in EXAMPLES.iter().enumerate() {
-                                ui.selectable_value(&mut self.example, index, *name);
-                            }
-                        });
-                    if old != self.example || ui.button("Restore example").clicked() {
-                        self.text = example_text(self.example);
-                        self.invalidate();
-                    }
-                });
-                let changed = egui::ScrollArea::vertical()
-                    .id_salt("input_text")
-                    .max_height(140.0)
-                    .show(ui, |ui| {
-                        ui.add(egui::TextEdit::multiline(&mut self.text).desired_rows(5).desired_width(f32::INFINITY)).changed()
-                    }).inner;
-                if changed {
-                    self.invalidate();
+            self.tokenizer_bar(ui);
+            ui.separator();
+            ui.horizontal(|ui| {
+                for (tab, name) in [
+                    (Tab::Texts, "Texts"),
+                    (Tab::Efficiency, "Compression efficiency"),
+                    (Tab::Compare, "Tokenizer comparison"),
+                    (Tab::Matrix, "Matrix"),
+                    (Tab::Simulator, "Simulator"),
+                ] {
+                    ui.selectable_value(&mut self.tab, tab, egui::RichText::new(name).size(16.0));
                 }
-                ui.small("Long examples repeat their passages. You can enter your own text in any language.");
-                ui.add_space(12.0);
-                ui.heading("3. Speed and playback");
-                ui.add(egui::Slider::new(&mut self.speed, 1.0..=1500.0).integer().text("tokens/s"));
-                ui.horizontal_wrapped(|ui| {
-                    if ui.button("Count tokens").clicked() {
-                        self.prepare();
-                    }
-                    if self.simulation.running {
-                        if ui.button("Pause").clicked() {
-                            self.simulation.pause();
-                        }
-                    } else if ui.button(if self.simulation.shown > 0 && self.simulation.shown < self.simulation.ids.len() { "Resume" } else { "Start" }).clicked() {
-                        if !self.prepared {
-                            self.prepare();
-                        }
-                        if self.prepared {
-                            self.simulation.start(Instant::now());
-                        }
-                    }
-                    if ui.button("Restart").clicked() && self.prepared {
-                        self.simulation.shown = self.simulation.ids.len();
-                        self.simulation.start(Instant::now());
-                    }
-                });
-                if let Some(error) = &self.error {
-                    ui.colored_label(egui::Color32::LIGHT_RED, error);
-                }
-                if self.prepared {
-                    let total = self.simulation.ids.len();
-                    ui.label(format!("Displayed: {} / {} tokens", self.simulation.shown, total));
-                    if total > 0 {
-                        ui.add(egui::ProgressBar::new(self.simulation.shown as f32 / total as f32).show_percentage());
-                        ui.label(format!("Estimated total time at current speed: {:.1} s", total as f64 / self.speed));
-                    } else {
-                        ui.label("The text contains no tokens.");
-                    }
-                } else {
-                    ui.label("Count tokens or start the simulation.");
-                }
-                ui.add_space(12.0);
-                ui.heading("Output");
-                egui::Frame::group(ui.style()).show(ui, |ui| {
-                    ui.set_min_height(120.0);
-                    ui.set_width(ui.available_width());
-                    ui.label(&self.simulation.output);
-                });
-                ui.small("This is a simulation, not model generation. Decoded text may differ from the input.");
             });
+            ui.separator();
+            ui.label(egui::RichText::new(tab_description(self.tab)).weak());
+            match self.tab {
+                Tab::Simulator => self.simulator_tab(ui),
+                tab => {
+                    egui::ScrollArea::vertical()
+                        .id_salt("tab_scroll")
+                        .show(ui, |ui| match tab {
+                            Tab::Texts => self.texts_tab(ui),
+                            Tab::Efficiency => self.efficiency_tab(ui),
+                            Tab::Compare => self.compare_tab(ui),
+                            _ => self.matrix_tab(ui),
+                        });
+                }
+            }
         });
-        if self.simulation.running {
-            ui.ctx()
-                .request_repaint_after(self.simulation.next_repaint(self.speed));
+        if let Some(sim) = self.sims.iter().flatten().find(|sim| sim.running) {
+            ui.ctx().request_repaint_after(sim.next_repaint(self.speed));
         }
     }
 }
@@ -284,13 +923,20 @@ fn run() -> eframe::Result {
     eframe::run_native(
         "Tokens per second",
         options,
-        Box::new(move |_cc| Ok(Box::new(app))),
+        Box::new(move |cc| {
+            apply_style(&cc.egui_ctx);
+            Ok(Box::new(app))
+        }),
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn example_text(index: usize) -> String {
+        repeat_text(&base_text(index))
+    }
 
     #[test]
     fn examples_are_long_enough_at_maximum_speed() {

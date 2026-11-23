@@ -37,6 +37,10 @@ impl TokenizerKind {
         })
     }
 
+    pub fn is_builtin(&self) -> bool {
+        matches!(self, Self::OpenAi { .. })
+    }
+
     pub fn name(&self) -> &str {
         match self {
             Self::OpenAi { name, .. } => name,
